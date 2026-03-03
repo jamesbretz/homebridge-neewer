@@ -1,0 +1,31 @@
+{
+  "name": "homebridge-neewer",
+  "version": "1.0.0",
+  "description": "Homebridge plugin for Neewer WiFi LED lights — direct UDP control, no app required",
+  "main": "index.js",
+  "license": "MIT",
+  "author": "James Bretz",
+  "homepage": "https://github.com/jamesbretz/homebridge-neewer#readme",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/jamesbretz/homebridge-neewer.git"
+  },
+  "bugs": {
+    "url": "https://github.com/jamesbretz/homebridge-neewer/issues"
+  },
+  "keywords": [
+    "homebridge-plugin",
+    "homekit",
+    "neewer",
+    "gl25c",
+    "led",
+    "lights",
+    "udp",
+    "wifi"
+  ],
+  "engines": {
+    "homebridge": ">=1.0.0",
+    "node": ">=14.0.0"
+  },
+  "dependencies": {}
+}

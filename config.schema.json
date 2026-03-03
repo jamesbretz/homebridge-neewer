@@ -1,0 +1,44 @@
+{
+  "pluginAlias": "NeewerLights",
+  "pluginType": "platform",
+  "singular": true,
+  "schema": {
+    "type": "object",
+    "properties": {
+      "name": {
+        "title": "Platform Name",
+        "type": "string",
+        "default": "Neewer Lights"
+      },
+      "autoDiscover": {
+        "title": "Auto-Discover Lights",
+        "type": "boolean",
+        "default": true,
+        "description": "Automatically discover Neewer lights on your network. If enabled and no lights are manually configured, the plugin will scan for lights on startup."
+      },
+      "lights": {
+        "title": "Lights (optional — leave empty to use auto-discovery)",
+        "type": "array",
+        "items": {
+          "title": "Light",
+          "type": "object",
+          "properties": {
+            "name": {
+              "title": "Name",
+              "type": "string",
+              "required": true,
+              "placeholder": "Studio Light Left"
+            },
+            "ip": {
+              "title": "IP Address",
+              "type": "string",
+              "required": true,
+              "placeholder": "192.168.0.139",
+              "format": "ipv4"
+            }
+          }
+        }
+      }
+    }
+  }
+}
