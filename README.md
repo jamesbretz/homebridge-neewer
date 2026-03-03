@@ -2,7 +2,7 @@
 
 A Homebridge plugin for controlling Neewer WiFi LED lights via Apple HomeKit.
 
-No Neewer app required. No cloud. Direct UDP control over your local network.
+This was entirely vibe coded, use at your own risk. Report bugs. Understand I may never touch this again.
 
 ## Features
 
