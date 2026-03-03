@@ -4,7 +4,7 @@ const dgram = require('dgram');
 const os = require('os');
 
 const PORT = 5052;
-const HEARTBEAT_INTERVAL = 250;
+const HEARTBEAT_INTERVAL = 1000; // 1 second is plenty
 const DISCOVERY_TIMEOUT = 10000; // 10 seconds to discover lights
 
 function getLocalIP() {
@@ -43,6 +43,21 @@ function rgbcwPacket(brightness, r, g, b, c, w) {
     Math.round(c) & 0xff,
     Math.round(w) & 0xff,
   );
+}
+
+// CCT mode brightness: 80 05 04 02 [brightness 0-100] 32 32 [checksum]
+function cctBrightnessPacket(brightness) {
+  return buildPacket(0x04, 0x02, Math.round(brightness) & 0xff, 0x32, 0x32);
+}
+
+// CCT mode color temperature: 80 05 05 03 [cct_raw] [gm_hi] [gm_lo] [checksum]
+// HomeKit mireds 140-500 → CCT raw range (warm=high, cool=low based on captures)
+// Captured: cct=0xd2=210 at warmer, cct=0x1a=26 at cooler — maps to ~32-220 range
+function cctTemperaturePacket(mireds) {
+  // Map 140 mireds (cool/7143K) → low CCT raw, 500 mireds (warm/2000K) → high CCT raw
+  const t = (mireds - 140) / (500 - 140);
+  const cctRaw = Math.round(20 + t * 200) & 0xff; // ~20 (cool) to ~220 (warm)
+  return buildPacket(0x05, 0x03, cctRaw, 0x00, 0x00);
 }
 
 function heartbeatPacket() {
@@ -151,12 +166,13 @@ class NeewerUDP {
   connect() {
     getSharedSocket(this.log, (socket) => {
       this.socket = socket;
+      this._lastReregister = 0;
 
       // Listen for messages from this light
       messageHandlers.set(this.ip, (msg) => this._handleMessage(msg));
 
       this.log.info(`[UDP ${this.ip}] Ready, controller IP: ${this.controllerIP}`);
-      this._sendRegistration();
+      this._sendRegistration(true); // true = include status request on first connect
       this._startHeartbeat();
     });
   }
@@ -166,25 +182,31 @@ class NeewerUDP {
     if (msg.length >= 5 && msg[0] === 0x80 && msg[1] === 0x07) {
       if (msg[2] === 0x02 && msg[3] === 0x01) {
         const power = msg[4] === 0x01;
-        this.log.info(`[UDP ${this.ip}] Status: power=${power}`);
+        this.log.debug(`[UDP ${this.ip}] Status: power=${power}`);
         if (this.onPowerState) this.onPowerState(power);
       }
     }
-    // Light broadcast (80 01) - re-register when light announces itself
+    // Light broadcast (80 01) - re-register when light announces itself, throttled to 5s
     if (msg[0] === 0x80 && msg[1] === 0x01) {
-      this.log.debug(`[UDP ${this.ip}] Light broadcast received, re-registering`);
-      this._sendRegistration();
+      const now = Date.now();
+      if (now - this._lastReregister > 5000) {
+        this._lastReregister = now;
+        this.log.debug(`[UDP ${this.ip}] Light reannounced, re-registering`);
+        this._sendRegistration(false);
+      }
     }
   }
 
-  _sendRegistration() {
+  _sendRegistration(withStatusRequest = false) {
     const pkt = registrationPacket(this.controllerIP);
-    const statusReq = Buffer.from([0x80, 0x06, 0x01, 0x01, 0x88]);
     this._send(pkt);
     setTimeout(() => this._send(pkt), 100);
     setTimeout(() => this._send(pkt), 200);
-    // Send status request after registration to complete handshake
-    setTimeout(() => this._send(statusReq), 350);
+    // Only request status on initial connect, not every re-registration
+    if (withStatusRequest) {
+      const statusReq = Buffer.from([0x80, 0x06, 0x01, 0x01, 0x88]);
+      setTimeout(() => this._send(statusReq), 350);
+    }
   }
 
   disconnect() {
@@ -204,7 +226,8 @@ class NeewerUDP {
     const hbPkt = heartbeatPacket();
     let tick = 0;
     this._heartbeatTimer = setInterval(() => {
-      this._send(tick % 4 === 0 ? regPkt : hbPkt);
+      // Send registration every 5s, heartbeat every 1s
+      this._send(tick % 5 === 0 ? regPkt : hbPkt);
       tick++;
     }, HEARTBEAT_INTERVAL);
   }
@@ -214,7 +237,8 @@ class NeewerUDP {
     const pkt = powerPacket(on);
     this._send(pkt);
     setTimeout(() => this._send(pkt), 100);
-    setTimeout(() => this._send(pkt), 200);
+    setTimeout(() => this._send(pkt), 300);
+    setTimeout(() => this._send(pkt), 800);
   }
 
   setRGBCW(brightness, r, g, b, c, w) {
@@ -223,6 +247,16 @@ class NeewerUDP {
     this._send(pkt);
     setTimeout(() => this._send(pkt), 100);
     setTimeout(() => this._send(pkt), 200);
+  }
+
+  setCCT(brightness, mireds) {
+    this.log.debug(`[UDP ${this.ip}] CCT: brightness=${brightness} mireds=${mireds}`);
+    const bPkt = cctBrightnessPacket(brightness);
+    const tPkt = cctTemperaturePacket(mireds);
+    this._send(bPkt);
+    this._send(tPkt);
+    setTimeout(() => { this._send(bPkt); this._send(tPkt); }, 100);
+    setTimeout(() => { this._send(bPkt); this._send(tPkt); }, 200);
   }
 }
 

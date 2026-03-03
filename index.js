@@ -18,6 +18,8 @@ class NeewerPlatform {
 
     this.api.on('didFinishLaunching', () => {
       this._init();
+      // Periodically re-scan to catch lights that dropped and reconnected
+      setInterval(() => this._rediscover(), 5 * 60 * 1000);
     });
   }
 
@@ -69,7 +71,7 @@ class NeewerPlatform {
       }
       const existing = this.accessories.find(a => a.context.ip === light.ip);
       if (existing) {
-        new NeewerAccessory(this.log, this.api, existing, light);
+        existing._neewerAccessory = new NeewerAccessory(this.log, this.api, existing, light);
       } else {
         this._addAccessory(light);
       }
@@ -80,10 +82,29 @@ class NeewerPlatform {
     const uuid = this.api.hap.uuid.generate(`neewer-${light.ip}`);
     const acc = new this.api.platformAccessory(light.name || light.ip, uuid);
     acc.context.ip = light.ip;
-    new NeewerAccessory(this.log, this.api, acc, light);
+    acc._neewerAccessory = new NeewerAccessory(this.log, this.api, acc, light);
     this.api.registerPlatformAccessories(PLUGIN_NAME, PLATFORM_NAME, [acc]);
     this.accessories.push(acc);
     this.log.info(`[Neewer] Added light: ${light.name} (${light.ip})`);
+  }
+
+  async _rediscover() {
+    this.log.info('[Neewer] Running periodic light scan...');
+    const discovered = await discoverLights(this.log, 10000);
+    for (const d of discovered) {
+      const existing = this.accessories.find(a => a.context.ip === d.ip);
+      if (!existing) {
+        this.log.info(`[Neewer] Rediscovered new light: ${d.model} at ${d.ip}`);
+        this._addAccessory({ name: d.model, ip: d.ip, model: d.model, mac: d.mac });
+      } else {
+        // Light is back — re-register it
+        this.log.info(`[Neewer] Rediscovered existing light at ${d.ip}, re-registering`);
+        const acc = existing;
+        if (acc._neewerAccessory) {
+          acc._neewerAccessory.udp._sendRegistration();
+        }
+      }
+    }
   }
 
   configureAccessory(accessory) {
@@ -102,19 +123,21 @@ class NeewerAccessory {
     this.udp = new NeewerUDP(config.ip, log);
     this.udp.connect();
 
-    // Internal state — will be updated from status response
+    // Restore state from persistent context, or use defaults
+    const ctx = accessory.context;
     this.state = {
-      on: false,
-      brightness: 100,
-      hue: 0,
-      saturation: 0,
-      colorTemp: 300,
+      on:          ctx.on          !== undefined ? ctx.on          : false,
+      brightness:  ctx.brightness  !== undefined ? ctx.brightness  : 100,
+      hue:         ctx.hue         !== undefined ? ctx.hue         : 0,
+      saturation:  ctx.saturation  !== undefined ? ctx.saturation  : 0,
+      colorTemp:   ctx.colorTemp   !== undefined ? ctx.colorTemp   : 300,
     };
 
     // Listen for power state updates from the light
     this.udp.onPowerState = (power) => {
       if (this.state.on !== power) {
         this.state.on = power;
+        this._saveState();
         const { Characteristic, Service } = this.api.hap;
         const bulb = this.accessory.getService(Service.Lightbulb);
         if (bulb) bulb.updateCharacteristic(Characteristic.On, power);
@@ -145,6 +168,7 @@ class NeewerAccessory {
       .onGet(() => this.state.on)
       .onSet((value) => {
         this.state.on = value;
+        this._saveState();
         this.udp.setPower(value);
         if (value) this._sendColor();
         this.log.info(`[Neewer] ${this.name}: ${value ? 'ON' : 'OFF'}`);
@@ -155,6 +179,7 @@ class NeewerAccessory {
       .onGet(() => this.state.brightness)
       .onSet((value) => {
         this.state.brightness = value;
+        this._saveState();
         this._sendColor();
         this.log.info(`[Neewer] ${this.name}: Brightness ${value}%`);
       });
@@ -165,6 +190,7 @@ class NeewerAccessory {
       .onSet((value) => {
         this.state.hue = value;
         this.state.saturation = this.state.saturation || 100;
+        this._saveState();
         this._sendColor();
         this.log.info(`[Neewer] ${this.name}: Hue ${value}`);
       });
@@ -174,6 +200,7 @@ class NeewerAccessory {
       .onGet(() => this.state.saturation)
       .onSet((value) => {
         this.state.saturation = value;
+        this._saveState();
         this._sendColor();
         this.log.info(`[Neewer] ${this.name}: Saturation ${value}%`);
       });
@@ -185,9 +212,18 @@ class NeewerAccessory {
       .onSet((value) => {
         this.state.colorTemp = value;
         this.state.saturation = 0;
+        this._saveState();
         this._sendColor();
         this.log.info(`[Neewer] ${this.name}: ColorTemp ${value} mireds`);
       });
+  }
+
+  _saveState() {
+    this.accessory.context.on         = this.state.on;
+    this.accessory.context.brightness  = this.state.brightness;
+    this.accessory.context.hue         = this.state.hue;
+    this.accessory.context.saturation  = this.state.saturation;
+    this.accessory.context.colorTemp   = this.state.colorTemp;
   }
 
   _sendColor() {
