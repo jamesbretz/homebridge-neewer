@@ -4,8 +4,7 @@ const dgram = require('dgram');
 const os = require('os');
 
 const PORT = 5052;
-const HEARTBEAT_INTERVAL = 1000; // 1 second is plenty
-const DISCOVERY_TIMEOUT = 10000; // 10 seconds to discover lights
+const DISCOVERY_TIMEOUT = 10000;
 
 function getLocalIP() {
   const interfaces = os.networkInterfaces();
@@ -45,33 +44,14 @@ function rgbcwPacket(brightness, r, g, b, c, w) {
   );
 }
 
-// CCT mode brightness: 80 05 04 02 [brightness 0-100] 32 32 [checksum]
-function cctBrightnessPacket(brightness) {
-  return buildPacket(0x04, 0x02, Math.round(brightness) & 0xff, 0x32, 0x32);
-}
+// The app sends 80 04 84 as a heartbeat ACK in response to the light's 80 03 83
+const HB_ACK = Buffer.from([0x80, 0x04, 0x84]);
+const STATUS_REQ = Buffer.from([0x80, 0x06, 0x01, 0x01, 0x88]);
 
-// CCT mode color temperature: 80 05 05 03 [cct_raw] [gm_hi] [gm_lo] [checksum]
-// HomeKit mireds 140-500 → CCT raw range (warm=high, cool=low based on captures)
-// Captured: cct=0xd2=210 at warmer, cct=0x1a=26 at cooler — maps to ~32-220 range
-function cctTemperaturePacket(mireds) {
-  // Map 140 mireds (cool/7143K) → low CCT raw, 500 mireds (warm/2000K) → high CCT raw
-  const t = (mireds - 140) / (500 - 140);
-  const cctRaw = Math.round(20 + t * 200) & 0xff; // ~20 (cool) to ~220 (warm)
-  return buildPacket(0x05, 0x03, cctRaw, 0x00, 0x00);
-}
-
-function heartbeatPacket() {
-  return Buffer.from([0x80, 0x04, 0x84]);
-}
-
-/**
- * Parse a light's broadcast/announce packet (80 01 ...)
- * Returns { ip, model, mac } or null
- */
 function parseBroadcast(msg) {
   if (msg.length < 20 || msg[0] !== 0x80 || msg[1] !== 0x01) return null;
   try {
-    let offset = 4; // skip 80 01 len_hi len_lo
+    let offset = 4;
     const fields = {};
     while (offset < msg.length - 1) {
       const fieldLen = msg[offset];
@@ -88,11 +68,11 @@ function parseBroadcast(msg) {
   return null;
 }
 
-// Shared socket singleton — one socket for all lights on port 5052
+// Shared socket singleton
 let sharedSocket = null;
 let sharedSocketReady = false;
 let sharedSocketQueue = [];
-const messageHandlers = new Map(); // ip -> callback
+const messageHandlers = new Map();
 
 function getSharedSocket(log, callback) {
   if (sharedSocketReady) return callback(sharedSocket);
@@ -104,14 +84,10 @@ function getSharedSocket(log, callback) {
     log.warn(`[Neewer] Shared socket error: ${err.message}`);
   });
   sharedSocket.on('message', (msg, rinfo) => {
-    // Dispatch to per-IP handlers
     const handler = messageHandlers.get(rinfo.address);
     if (handler) handler(msg, rinfo);
-    // Also dispatch broadcast to all handlers (for discovery)
-    if (rinfo.address !== '255.255.255.255') {
-      const broadcastHandler = messageHandlers.get('*');
-      if (broadcastHandler) broadcastHandler(msg, rinfo);
-    }
+    const broadcastHandler = messageHandlers.get('*');
+    if (broadcastHandler) broadcastHandler(msg, rinfo);
   });
   sharedSocket.bind(PORT, () => {
     sharedSocket.setBroadcast(true);
@@ -122,30 +98,24 @@ function getSharedSocket(log, callback) {
   });
 }
 
-/**
- * Discover Neewer lights on the network by listening for their broadcast packets.
- * Returns a promise that resolves to an array of { ip, model, mac, name } objects.
- */
 function discoverLights(log, timeout) {
   return new Promise((resolve) => {
     const found = new Map();
     const localIP = getLocalIP();
-
     getSharedSocket(log, (socket) => {
-      // Register broadcast handler
       messageHandlers.set('*', (msg, rinfo) => {
         const info = parseBroadcast(msg);
         if (info && !found.has(info.ip)) {
           log.info(`[Neewer] Discovered light: ${info.model} at ${info.ip} (${info.mac})`);
           found.set(info.ip, info);
-          // Send registration immediately when we discover a light
-          const regPkt = registrationPacket(localIP);
-          socket.send(regPkt, 0, regPkt.length, PORT, info.ip);
-          setTimeout(() => socket.send(regPkt, 0, regPkt.length, PORT, info.ip), 100);
-          setTimeout(() => socket.send(regPkt, 0, regPkt.length, PORT, info.ip), 200);
+          // Register 4x at ~50ms like the Mac app does
+          const reg = registrationPacket(localIP);
+          socket.send(reg, 0, reg.length, PORT, info.ip);
+          setTimeout(() => socket.send(reg, 0, reg.length, PORT, info.ip), 50);
+          setTimeout(() => socket.send(reg, 0, reg.length, PORT, info.ip), 100);
+          setTimeout(() => socket.send(reg, 0, reg.length, PORT, info.ip), 150);
         }
       });
-
       setTimeout(() => {
         messageHandlers.delete('*');
         resolve(Array.from(found.values()));
@@ -159,25 +129,42 @@ class NeewerUDP {
     this.ip = ip;
     this.log = log;
     this.controllerIP = controllerIP || getLocalIP();
-    this._heartbeatTimer = null;
-    this.onPowerState = null; // callback(boolean) for power state updates
+    this._lastReregister = 0;
+    this.onPowerState = null;
   }
 
   connect() {
     getSharedSocket(this.log, (socket) => {
       this.socket = socket;
-      this._lastReregister = 0;
-
-      // Listen for messages from this light
       messageHandlers.set(this.ip, (msg) => this._handleMessage(msg));
+      this.log.info(`[UDP ${this.ip}] Ready`);
 
-      this.log.info(`[UDP ${this.ip}] Ready, controller IP: ${this.controllerIP}`);
-      this._sendRegistration(true); // true = include status request on first connect
-      this._startHeartbeat();
+      // Register 4x at ~50ms intervals, exactly like the Mac app
+      const reg = registrationPacket(this.controllerIP);
+      this._send(reg);
+      setTimeout(() => this._send(reg), 50);
+      setTimeout(() => this._send(reg), 100);
+      setTimeout(() => this._send(reg), 150);
+      // Request status after registration
+      setTimeout(() => this._send(STATUS_REQ), 300);
+
+      // Re-register every 30s to reclaim control if another app took over
+      this._regTimer = setInterval(() => {
+        this._send(registrationPacket(this.controllerIP));
+      }, 30000);
     });
   }
 
   _handleMessage(msg) {
+    // Light heartbeat: 80 03 — respond with ACK, throttled to once per second
+    if (msg.length >= 3 && msg[0] === 0x80 && msg[1] === 0x03) {
+      const now = Date.now();
+      if (!this._lastAck || now - this._lastAck > 1000) {
+        this._lastAck = now;
+        this._send(HB_ACK);
+      }
+    }
+
     // Status response: 80 07 02 01 [power] [checksum]
     if (msg.length >= 5 && msg[0] === 0x80 && msg[1] === 0x07) {
       if (msg[2] === 0x02 && msg[3] === 0x01) {
@@ -186,31 +173,24 @@ class NeewerUDP {
         if (this.onPowerState) this.onPowerState(power);
       }
     }
-    // Light broadcast (80 01) - re-register when light announces itself, throttled to 5s
+
+    // Light reannounced (80 01) — re-register 4x, throttled to once per 10s
     if (msg[0] === 0x80 && msg[1] === 0x01) {
       const now = Date.now();
-      if (now - this._lastReregister > 5000) {
+      if (now - this._lastReregister > 10000) {
         this._lastReregister = now;
         this.log.debug(`[UDP ${this.ip}] Light reannounced, re-registering`);
-        this._sendRegistration(false);
+        const reg = registrationPacket(this.controllerIP);
+        this._send(reg);
+        setTimeout(() => this._send(reg), 50);
+        setTimeout(() => this._send(reg), 100);
+        setTimeout(() => this._send(reg), 150);
       }
     }
   }
 
-  _sendRegistration(withStatusRequest = false) {
-    const pkt = registrationPacket(this.controllerIP);
-    this._send(pkt);
-    setTimeout(() => this._send(pkt), 100);
-    setTimeout(() => this._send(pkt), 200);
-    // Only request status on initial connect, not every re-registration
-    if (withStatusRequest) {
-      const statusReq = Buffer.from([0x80, 0x06, 0x01, 0x01, 0x88]);
-      setTimeout(() => this._send(statusReq), 350);
-    }
-  }
-
   disconnect() {
-    if (this._heartbeatTimer) { clearInterval(this._heartbeatTimer); this._heartbeatTimer = null; }
+    if (this._regTimer) { clearInterval(this._regTimer); this._regTimer = null; }
     messageHandlers.delete(this.ip);
   }
 
@@ -221,42 +201,24 @@ class NeewerUDP {
     });
   }
 
-  _startHeartbeat() {
-    const regPkt = registrationPacket(this.controllerIP);
-    const hbPkt = heartbeatPacket();
-    let tick = 0;
-    this._heartbeatTimer = setInterval(() => {
-      // Send registration every 5s, heartbeat every 1s
-      this._send(tick % 5 === 0 ? regPkt : hbPkt);
-      tick++;
-    }, HEARTBEAT_INTERVAL);
+  // Stagger bursts so two lights don't collide on the shared socket
+  _sendBurst(packets, spacing = 50) {
+    packets.forEach((pkt, i) => {
+      setTimeout(() => this._send(pkt), i * spacing);
+    });
   }
 
   setPower(on) {
     this.log.info(`[Neewer] ${this.ip}: Power ${on ? 'ON' : 'OFF'}`);
     const pkt = powerPacket(on);
-    this._send(pkt);
-    setTimeout(() => this._send(pkt), 100);
-    setTimeout(() => this._send(pkt), 300);
-    setTimeout(() => this._send(pkt), 800);
+    this._sendBurst([pkt, pkt, pkt]);
+    setTimeout(() => this._sendBurst([pkt, pkt]), 500);
   }
 
   setRGBCW(brightness, r, g, b, c, w) {
     this.log.debug(`[UDP ${this.ip}] RGBCW: brightness=${brightness} R=${r} G=${g} B=${b} C=${c} W=${w}`);
     const pkt = rgbcwPacket(brightness, r, g, b, c, w);
-    this._send(pkt);
-    setTimeout(() => this._send(pkt), 100);
-    setTimeout(() => this._send(pkt), 200);
-  }
-
-  setCCT(brightness, mireds) {
-    this.log.debug(`[UDP ${this.ip}] CCT: brightness=${brightness} mireds=${mireds}`);
-    const bPkt = cctBrightnessPacket(brightness);
-    const tPkt = cctTemperaturePacket(mireds);
-    this._send(bPkt);
-    this._send(tPkt);
-    setTimeout(() => { this._send(bPkt); this._send(tPkt); }, 100);
-    setTimeout(() => { this._send(bPkt); this._send(tPkt); }, 200);
+    this._sendBurst([pkt, pkt, pkt]);
   }
 }
 

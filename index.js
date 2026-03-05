@@ -64,25 +64,26 @@ class NeewerPlatform {
     });
 
     // Add or reconfigure lights
-    for (const light of lights) {
+    for (let i = 0; i < lights.length; i++) {
+      const light = lights[i];
       if (!light.ip) {
         this.log.warn(`[Neewer] Light "${light.name}" has no IP address — skipping.`);
         continue;
       }
       const existing = this.accessories.find(a => a.context.ip === light.ip);
       if (existing) {
-        existing._neewerAccessory = new NeewerAccessory(this.log, this.api, existing, light);
+        existing._neewerAccessory = new NeewerAccessory(this.log, this.api, existing, light, i);
       } else {
-        this._addAccessory(light);
+        this._addAccessory(light, i);
       }
     }
   }
 
-  _addAccessory(light) {
+  _addAccessory(light, index = 0) {
     const uuid = this.api.hap.uuid.generate(`neewer-${light.ip}`);
     const acc = new this.api.platformAccessory(light.name || light.ip, uuid);
     acc.context.ip = light.ip;
-    acc._neewerAccessory = new NeewerAccessory(this.log, this.api, acc, light);
+    acc._neewerAccessory = new NeewerAccessory(this.log, this.api, acc, light, index);
     this.api.registerPlatformAccessories(PLUGIN_NAME, PLATFORM_NAME, [acc]);
     this.accessories.push(acc);
     this.log.info(`[Neewer] Added light: ${light.name} (${light.ip})`);
@@ -101,7 +102,7 @@ class NeewerPlatform {
         this.log.info(`[Neewer] Rediscovered existing light at ${d.ip}, re-registering`);
         const acc = existing;
         if (acc._neewerAccessory) {
-          acc._neewerAccessory.udp._sendRegistration();
+          acc._neewerAccessory.udp.connect();
         }
       }
     }
@@ -113,15 +114,17 @@ class NeewerPlatform {
 }
 
 class NeewerAccessory {
-  constructor(log, api, accessory, config) {
+  constructor(log, api, accessory, config, index = 0) {
     this.log = log;
     this.api = api;
     this.accessory = accessory;
     this.config = config;
     this.name = config.name || config.ip;
+    this.cmdDelay = index * 150; // stagger lights by 150ms each
 
     this.udp = new NeewerUDP(config.ip, log);
     this.udp.connect();
+    this._colorTimer = null; // debounce timer for color changes
 
     // Restore state from persistent context, or use defaults
     const ctx = accessory.context;
@@ -169,8 +172,10 @@ class NeewerAccessory {
       .onSet((value) => {
         this.state.on = value;
         this._saveState();
-        this.udp.setPower(value);
-        if (value) this._sendColor();
+        setTimeout(() => {
+          this.udp.setPower(value);
+          if (value) this._sendColor();
+        }, this.cmdDelay);
         this.log.info(`[Neewer] ${this.name}: ${value ? 'ON' : 'OFF'}`);
       });
 
@@ -180,7 +185,7 @@ class NeewerAccessory {
       .onSet((value) => {
         this.state.brightness = value;
         this._saveState();
-        this._sendColor();
+        setTimeout(() => this._sendColor(), this.cmdDelay);
         this.log.info(`[Neewer] ${this.name}: Brightness ${value}%`);
       });
 
@@ -191,7 +196,7 @@ class NeewerAccessory {
         this.state.hue = value;
         this.state.saturation = this.state.saturation || 100;
         this._saveState();
-        this._sendColor();
+        setTimeout(() => this._sendColor(), this.cmdDelay);
         this.log.info(`[Neewer] ${this.name}: Hue ${value}`);
       });
 
@@ -201,7 +206,7 @@ class NeewerAccessory {
       .onSet((value) => {
         this.state.saturation = value;
         this._saveState();
-        this._sendColor();
+        setTimeout(() => this._sendColor(), this.cmdDelay);
         this.log.info(`[Neewer] ${this.name}: Saturation ${value}%`);
       });
 
@@ -213,7 +218,7 @@ class NeewerAccessory {
         this.state.colorTemp = value;
         this.state.saturation = 0;
         this._saveState();
-        this._sendColor();
+        setTimeout(() => this._sendColor(), this.cmdDelay);
         this.log.info(`[Neewer] ${this.name}: ColorTemp ${value} mireds`);
       });
   }
@@ -227,14 +232,19 @@ class NeewerAccessory {
   }
 
   _sendColor() {
-    const brightness = Math.round(this.state.brightness);
-    if (this.state.saturation < 10) {
-      const { c, w } = this._miredsToWhiteChannels(this.state.colorTemp);
-      this.udp.setRGBCW(brightness, 0, 0, 0, c, w);
-    } else {
-      const { r, g, b } = this._hsvToRgb(this.state.hue, this.state.saturation, 100);
-      this.udp.setRGBCW(brightness, r, g, b, 0, 0);
-    }
+    // Debounce — wait 80ms after last change before sending
+    if (this._colorTimer) clearTimeout(this._colorTimer);
+    this._colorTimer = setTimeout(() => {
+      this._colorTimer = null;
+      const brightness = Math.round(this.state.brightness);
+      if (this.state.saturation < 10) {
+        const { c, w } = this._miredsToWhiteChannels(this.state.colorTemp);
+        this.udp.setRGBCW(brightness, 0, 0, 0, c, w);
+      } else {
+        const { r, g, b } = this._hsvToRgb(this.state.hue, this.state.saturation, 100);
+        this.udp.setRGBCW(brightness, r, g, b, 0, 0);
+      }
+    }, 80);
   }
 
   _miredsToWhiteChannels(mireds) {
