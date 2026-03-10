@@ -148,10 +148,15 @@ class NeewerUDP {
       // Request status after registration
       setTimeout(() => this._send(STATUS_REQ), 300);
 
-      // Re-register every 30s to reclaim control if another app took over
+      // Re-register every 10s to reclaim control if registration is lost
       this._regTimer = setInterval(() => {
         this._send(registrationPacket(this.controllerIP));
-      }, 30000);
+      }, 10000);
+
+      // Keepalive every 3s — ESP8266/ESP32 WiFi power saving needs frequent traffic
+      this._keepaliveTimer = setInterval(() => {
+        this._send(HB_ACK);
+      }, 3000);
     });
   }
 
@@ -191,6 +196,7 @@ class NeewerUDP {
 
   disconnect() {
     if (this._regTimer) { clearInterval(this._regTimer); this._regTimer = null; }
+    if (this._keepaliveTimer) { clearInterval(this._keepaliveTimer); this._keepaliveTimer = null; }
     messageHandlers.delete(this.ip);
   }
 

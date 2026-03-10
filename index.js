@@ -53,16 +53,8 @@ class NeewerPlatform {
   }
 
   _syncAccessories(lights) {
-    // Remove accessories no longer present
-    this.accessories = this.accessories.filter(acc => {
-      const still = lights.find(l => l.ip === acc.context.ip);
-      if (!still) {
-        this.api.unregisterPlatformAccessories(PLUGIN_NAME, PLATFORM_NAME, [acc]);
-        return false;
-      }
-      return true;
-    });
-
+    // Never remove cached accessories — a light may just be offline temporarily.
+    // Only add/configure lights that are in the config or were discovered.
     // Add or reconfigure lights
     for (let i = 0; i < lights.length; i++) {
       const light = lights[i];

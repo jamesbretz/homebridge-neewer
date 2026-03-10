@@ -1,6 +1,6 @@
 {
   "name": "homebridge-neewer",
-  "version": "1.0.0",
+  "version": "1.0.2",
   "description": "Homebridge plugin for Neewer WiFi LED lights — direct UDP control, no app required",
   "main": "index.js",
   "license": "MIT",
@@ -26,6 +26,9 @@
   "engines": {
     "homebridge": ">=1.0.0",
     "node": ">=14.0.0"
+  },
+  "peerDependencies": {
+    "homebridge": ">=1.0.0"
   },
   "dependencies": {}
 }
