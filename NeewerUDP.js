@@ -44,8 +44,6 @@ function rgbcwPacket(brightness, r, g, b, c, w) {
   );
 }
 
-// The app sends 80 04 84 as a heartbeat ACK in response to the light's 80 03 83
-const HB_ACK = Buffer.from([0x80, 0x04, 0x84]);
 const STATUS_REQ = Buffer.from([0x80, 0x06, 0x01, 0x01, 0x88]);
 
 function parseBroadcast(msg) {
@@ -148,27 +146,16 @@ class NeewerUDP {
       // Request status after registration
       setTimeout(() => this._send(STATUS_REQ), 300);
 
-      // Re-register every 10s to reclaim control if registration is lost
+      // Re-register every 10s to keep registration active
       this._regTimer = setInterval(() => {
         this._send(registrationPacket(this.controllerIP));
       }, 10000);
-
-      // Keepalive every 3s — ESP8266/ESP32 WiFi power saving needs frequent traffic
-      this._keepaliveTimer = setInterval(() => {
-        this._send(HB_ACK);
-      }, 3000);
     });
   }
 
   _handleMessage(msg) {
-    // Light heartbeat: 80 03 — respond with ACK, throttled to once per second
-    if (msg.length >= 3 && msg[0] === 0x80 && msg[1] === 0x03) {
-      const now = Date.now();
-      if (!this._lastAck || now - this._lastAck > 1000) {
-        this._lastAck = now;
-        this._send(HB_ACK);
-      }
-    }
+    // Light heartbeat: 80 03 — one-way ping from light, no response needed
+    // (80 04 does not exist in the light firmware)
 
     // Status response: 80 07 02 01 [power] [checksum]
     if (msg.length >= 5 && msg[0] === 0x80 && msg[1] === 0x07) {
@@ -196,7 +183,6 @@ class NeewerUDP {
 
   disconnect() {
     if (this._regTimer) { clearInterval(this._regTimer); this._regTimer = null; }
-    if (this._keepaliveTimer) { clearInterval(this._keepaliveTimer); this._keepaliveTimer = null; }
     messageHandlers.delete(this.ip);
   }
 
